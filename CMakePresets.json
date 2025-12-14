@@ -1,0 +1,14 @@
+{
+  "version": 10,
+  "configurePresets": [
+    {
+      "name": "default",
+      "binaryDir": "${sourceDir}/build",
+      "generator": "MinGW Makefiles",
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+        "SRC_DIR": "${sourceDir}/src"
+      }
+    }
+  ]
+}

@@ -1,1 +1,2 @@
-# I hate github 2fa
+#  MeshSolve
+A c rewrite of my python pde solver. Will be implemented as a python package with a new interface.
