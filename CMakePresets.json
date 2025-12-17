@@ -1,5 +1,10 @@
 {
     "version": 10,
+    "cmakeMinimumRequired": {
+        "major": 4,
+        "minor": 0,
+        "patch": 0
+    },
     "configurePresets": [
         {
             "name": "default",
@@ -7,14 +12,17 @@
             "generator": "MinGW Makefiles",
             "cacheVariables": {
                 "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
-                "SRC_DIR": "${sourceDir}/src"
+                "SRC_DIR": "${sourceDir}/src",
+                "CMAKE_BUILD_TYPE": "Debug",
+                "COMPILE_TO_DLL": "ON"
             }
         },
         {
             "name": "debug",
             "inherits": "default",
             "cacheVariables": {
-                "CMAKE_BUILD_TYPE": "Debug"
+                "CMAKE_BUILD_TYPE": "Debug",
+                "COMPILE_TO_DLL": "OFF"
             }
         }
     ],

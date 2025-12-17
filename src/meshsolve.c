@@ -3,6 +3,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include "meshsolve.h"
+
+typedef struct Region {
+    double* element_map;
+    int* face_map;
+    int element_map_size;
+    int element_num;
+    int shape_num;
+    int point_num;
+} Region;
 
 // Reference for arrays that will be freed later
 double* array_reference[128];
@@ -12,7 +22,7 @@ int array_index = 0;
 void print_matrix(double* matrix, int sizex, int sizey) {
     for (int i = 0; i < sizey; i++) {
         for (int j = 0; j < sizex; j++) {
-            printf("%.2f ", matrix[i + j*sizey]);
+            printf("%.4f ", matrix[i + j*sizey]);
         }
         printf("\n");
     }
@@ -21,7 +31,7 @@ void print_matrix(double* matrix, int sizex, int sizey) {
 double* create_array(size_t size) {
     double* memory = (double*) malloc(size * sizeof(double));
     if (!memory) {
-        printf("Error during memory allocation");
+        printf("Error during memory allocation\n");
         return NULL;
     }
     for (int i = 0; i < size; i++) {
@@ -50,20 +60,49 @@ double determinant_2d(double* matrix) {
 }
 
 // Used for conversion from pyvista meshes to elements
-double* get_2d_elements(int* points, int* face_map) {
-    int i = 0;
-    size_t face_num = sizeof(face_map) / sizeof(int);
-    
-    double* elements = array_constructor(face_num * 2);
+Region get_region(double* points, int* face_map, size_t face_map_size, size_t points_size) {
+    /*
+    Face map is the input for the pyvista face definitions. A number N of elements is defined
+    and then the N following members of the array are the index of the points at the points
+    array for said element. Of course in python points is a matrix so you can access individual
+    points, but here once you map those points for each element you have to double the number
+    of members in the resulting array slice. Since realistically you would only imput tri or
+    quad meshes there is no need to keep checking the number of points per element very time
+    */
 
-    while (i < face_num) {
+    int i = 1;
+    int j = 0;
+    int point_count = 0;
+    Region region;
+    
+    double* elements = array_constructor(face_map_size * 2); 
+    int shape_num = face_map[0];
+
+    while (i < face_map_size) {
         int index = face_map[i] * 2;
-        elements[i*2] = points[index];
-        elements[i*2+1] = points[index+1];
+        if (point_count < shape_num) {
+            elements[j*2] = points[index];
+            elements[j*2+1] = points[index+1];
+            j++;
+            point_count++;
+        }  
+        else {
+            point_count = 0;
+        }
         i++;
     }
 
-    return elements;
+    //Names here are actually really bad lol
+    // j is the counter of total points described in the face map
+
+    region.element_map = elements; // List of elements by their points
+    region.element_map_size = j * 2; // Number of total x and y points in said list
+    region.element_num = face_map_size / (shape_num + 1); // Number of actual elements
+    region.face_map = face_map;
+    region.shape_num = shape_num; // The number of points per element AKA number of shape functions
+    region.point_num = points_size / 2;
+
+    return region;
 }
 
 // Shape function interpolations for a quadrilateral reference element
@@ -90,10 +129,10 @@ double* grad_shape_funcs_quad(double xi, double eta) {
 // Jacobian of the transformation from quadrilateral reference element
 double* jacobian_quad(double* element, double* gradient) {
     static double jacobian[4];
-    double* dxi; dxi = &(gradient[0]);
-    double* deta; deta = &(gradient[1]);
-    double* x; x = &(element[0]);
-    double* y; y = &(element[1]);
+    double* dxi = &(gradient[0]);
+    double* deta = &(gradient[1]);
+    double* x = &(element[0]);
+    double* y = &(element[1]);
 
     jacobian[0] = cblas_ddot(4, x, 2, dxi, 2);
     jacobian[1] = cblas_ddot(4, x, 2, deta, 2);
@@ -105,7 +144,7 @@ double* jacobian_quad(double* element, double* gradient) {
 
 // Integration with gauss-legendre quadrature
 // TODO add more order options
-double* quad_integral(double* (*integrand)(double), int shape_num) {
+double* integral_quad(double* (*integrand)(double), int shape_num) {
     int order = 2;
     double gauss_points[2] = {-1/sqrt(3), 1/sqrt(3)};
     // Weights for 2 points are 1, 1 soo...
@@ -121,7 +160,7 @@ double* quad_integral(double* (*integrand)(double), int shape_num) {
 }
 
 // Double integration
-double* dbl_quad_integral(double* (*integrand)(double, double), int shape_num) {
+double* dbl_integral_quad(double* (*integrand)(double, double), int shape_num) {
     int order = 2;
     double gauss_points[2] = {-1/sqrt(3), 1/sqrt(3)};
     // Weights for 2 points are 1, 1 soo...
@@ -140,7 +179,7 @@ double* dbl_quad_integral(double* (*integrand)(double, double), int shape_num) {
 
 // The actually useful part
 // TODO add triangular elements
-double quad_element_buffer[4];
+double quad_element_buffer[8];
 
 // Integral for transient term ∂T/∂t on a quadrilateral element
 double* transient_integrand(double x, double y) {
@@ -161,17 +200,57 @@ double* transient_integrand(double x, double y) {
 
 // Wrapper for transient elements, only for quadrilateral elements
 double* transient_wrapper(double* element, int shape_num) {
-    memcpy(quad_element_buffer, element, 4 * sizeof(double));
-    double* element_stiffness = dbl_quad_integral(transient_integrand, shape_num * shape_num);
+    memcpy(quad_element_buffer, element, 8 * sizeof(double));
+    double* element_stiffness = dbl_integral_quad(transient_integrand, shape_num * shape_num);
     return element_stiffness;
 }
 
-// TODO ensure safety when passing the number of shape functions
-int main() {
-    double test_element[8] = {8.0, 2.0, 5.0, 6.0, 1.0, 2.0, 8.0, 9.0};
-    double* matrix = transient_wrapper(test_element, 4);
-    print_matrix(matrix, 4, 4);
-    free(matrix); matrix = NULL;
+// Global matrix creation
+// TODO support multiple dof and multiple terms
+double* matrix_factory(Region region, int* term_list, int dof) {
+    double* element_map = region.element_map;
+    int* face_map = region.face_map;
+    int element_map_size = region.element_map_size;
+    int element_num = region.element_num;
+    int shape_num = region.shape_num;
+    int point_num = region.point_num;
 
+    // Each point contributes with its own degrees of freedom
+    int total_dof = point_num * dof;
+    double* global_matrix = array_constructor(total_dof * total_dof);
+
+    // Assembly into global matrix per element
+    for (int i = 0; i < element_num; i++) {
+        double* element = &(element_map[i*shape_num*2]);
+        double* element_matrix = transient_wrapper(element, shape_num);
+
+        int* map = &(face_map[i*(shape_num+1)+1]);
+
+        for (int j = 0; j < shape_num; j++) {
+            for (int k = 0; k < shape_num; k++) {
+                int index = total_dof * map[j] + map[k];
+                global_matrix[index] += element_matrix[shape_num * j + k];
+            }
+        }
+        free(element_matrix); element_matrix = NULL;
+    }
+
+    return global_matrix;
+}
+
+void test_function(double* points, int* face_map, size_t face_map_size, size_t points_size) {
+    Region region = get_region(points, face_map, face_map_size, points_size);
+    double* global_matrix = matrix_factory(region, NULL, 1);
+    print_matrix(global_matrix, region.point_num, region.point_num);
+    array_destructor;
+}
+
+// Test function with values collected from the main.py test mesh
+int main() {
+    int face_map[20] = {4, 0, 1, 4, 3, 4, 1, 2, 5, 4, 4, 3, 4, 7, 6, 4, 4, 5, 8, 7};
+    double points[18] = {-0.5, -0.5, 0.0, -0.5, 0.5, -0.5, -0.5, 0.0, 0.0, 
+        0.0, 0.5, 0.0, -0.5, 0.5, 0.0, 0.5, 0.5, 0.5};
+
+    test_function(points, face_map, 20, 18);
     return 0;
 }

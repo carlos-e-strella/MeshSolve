@@ -1,3 +1,7 @@
+# Build and environment files
 /.vscode
 /build
 /.venv
+
+# Python code is not working right now
+*.py
