@@ -1,3 +1,6 @@
+// Using the clapack fortran to c interface plus some lines to stop conficts with c definitions
+// I REFUSE to build lapacke from source
+#include "lapack_interface.h"
 #include <cblas.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,6 +16,11 @@ typedef struct Region {
     int shape_num;
     int point_num;
 } Region;
+
+typedef enum Term {
+    TRANSIENT,
+    DIFFUSION
+} Term;
 
 // Reference for arrays that will be freed later
 double* array_reference[128];
@@ -127,10 +135,10 @@ double* grad_shape_funcs_quad(double xi, double eta) {
 }
 
 // Jacobian of the transformation from quadrilateral reference element
-double* jacobian_quad(double* element, double* gradient) {
+double* jacobian_quad(double* element, double* gradients) {
     static double jacobian[4];
-    double* dxi = &(gradient[0]);
-    double* deta = &(gradient[1]);
+    double* dxi = &(gradients[0]);
+    double* deta = &(gradients[1]);
     double* x = &(element[0]);
     double* y = &(element[1]);
 
@@ -185,29 +193,70 @@ double quad_element_buffer[8];
 double* transient_integrand(double x, double y) {
     // Size four arrays
     double* shape_funcs = shape_funcs_quad(x, y);
-    double* gradient = grad_shape_funcs_quad(x, y); 
+    double* gradients = grad_shape_funcs_quad(x, y); 
 
     // 2x2 matrix
-    double* jacobian = jacobian_quad(quad_element_buffer, gradient);
+    double* jacobian = jacobian_quad(quad_element_buffer, gradients);
     double determinant = determinant_2d(jacobian);
 
     // 4x4 element matrix
-    // N ⊗ N for each quadrature point
+    // Element matrix: Kij = Ni * Nj
     double* integrand = create_array(16);
-    cblas_dger(CblasColMajor, 4, 4, determinant, shape_funcs, 1, shape_funcs, 1, integrand, 4);
+    if (determinant) {
+        cblas_dger(CblasColMajor, 4, 4, determinant, shape_funcs, 1, shape_funcs, 1, integrand, 4);
+    }
+    else {
+        printf("WARN: Singular jacobian. Check your mesh geometry\n");
+    }
     return integrand;
 }
 
-// Wrapper for transient elements, only for quadrilateral elements
-double* transient_wrapper(double* element, int shape_num) {
-    memcpy(quad_element_buffer, element, 8 * sizeof(double));
-    double* element_stiffness = dbl_integral_quad(transient_integrand, shape_num * shape_num);
-    return element_stiffness;
+// Integral for diffusion term ∇²T on a quadrilateral element
+double* diffusion_integrand(double x, double y) {
+    // Size four arrays
+    double* shape_funcs = shape_funcs_quad(x, y);
+    double* gradients = grad_shape_funcs_quad(x, y);
+    double* jacobian = jacobian_quad(quad_element_buffer, gradients);
+    
+    double determinant = determinant_2d(jacobian);
+
+    // Element matrix: Kij ∇Ni · ∇Nj 
+    double* integrand = create_array(16);
+    integer ipiv[2]; // Pivot matrix required for decomposition
+    integer size = 2;  
+    integer info;
+
+    double work[64]; integer work_size = 64;
+
+    if (determinant) {
+        dgetrf_(&size, &size, jacobian, &size, ipiv, &info);
+        dgetri_(&size, jacobian, &size, ipiv, work, &work_size, &info);
+        // jacobian pointer now holds the inverse jacobian
+
+        // Generate gradients in global coordinates for 4 shape functions
+        // Multiplies inverse transpose jacobian to each shape function gradient
+        double global_gradients[8];
+        for (int i = 0; i < 4; i++) {
+            double* gradient = &(gradients[i*2]);
+            double* global_gradient = &(global_gradients[i*2]);
+            cblas_dgemv(CblasColMajor, CblasTrans, 2, 2, 1, jacobian, 2, gradient, 1, 0, global_gradient, 1);
+        }
+
+        double* x = &(global_gradients[0]);
+        double* y = &(global_gradients[1]);
+
+        cblas_dger(CblasColMajor, 4, 4, determinant, x, 2, x, 2, integrand, 4);
+        cblas_dger(CblasColMajor, 4, 4, 1, y, 2, y, 2, integrand, 4);
+    }
+    else {
+        printf("WARN: This element's jacobian is singular. Bad mesh geometry much?\n");
+    }
+    return integrand;
 }
 
 // Global matrix creation
 // TODO support multiple dof and multiple terms
-double* matrix_factory(Region region, int* term_list, int dof) {
+double* matrix_factory(Region region, Term term, int dof) {
     double* element_map = region.element_map;
     int* face_map = region.face_map;
     int element_map_size = region.element_map_size;
@@ -220,9 +269,21 @@ double* matrix_factory(Region region, int* term_list, int dof) {
     double* global_matrix = array_constructor(total_dof * total_dof);
 
     // Assembly into global matrix per element
+    // Currently only supports quad elements
     for (int i = 0; i < element_num; i++) {
         double* element = &(element_map[i*shape_num*2]);
-        double* element_matrix = transient_wrapper(element, shape_num);
+        memcpy(quad_element_buffer, element, 8 * sizeof(double));
+
+        int shape_array_num = shape_num * shape_num;
+        double* element_matrix;
+        switch (term) {
+            case TRANSIENT: 
+                element_matrix = dbl_integral_quad(transient_integrand, shape_array_num);
+                break;
+            case DIFFUSION:
+                element_matrix = dbl_integral_quad(diffusion_integrand, shape_array_num);
+        }
+        element_matrix = transient_wrapper(element, shape_num);
 
         int* map = &(face_map[i*(shape_num+1)+1]);
 
@@ -240,13 +301,16 @@ double* matrix_factory(Region region, int* term_list, int dof) {
 
 void test_function(double* points, int* face_map, size_t face_map_size, size_t points_size) {
     Region region = get_region(points, face_map, face_map_size, points_size);
-    double* global_matrix = matrix_factory(region, NULL, 1);
+    double* global_matrix = matrix_factory(region, TRANSIENT, 1);
     print_matrix(global_matrix, region.point_num, region.point_num);
     array_destructor;
 }
 
-// Test function with values collected from the main.py test mesh
+// Test function with values collected from a pyvista mesh
+// The mesh is a square subdivided into 9 parts
+
 int main() {
+    int ispec = 1;
     int face_map[20] = {4, 0, 1, 4, 3, 4, 1, 2, 5, 4, 4, 3, 4, 7, 6, 4, 4, 5, 8, 7};
     double points[18] = {-0.5, -0.5, 0.0, -0.5, 0.5, -0.5, -0.5, 0.0, 0.0, 
         0.0, 0.5, 0.0, -0.5, 0.5, 0.0, 0.5, 0.5, 0.5};

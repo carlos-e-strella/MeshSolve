@@ -18,6 +18,11 @@ typedef struct Region {
     int point_num;
 } Region;
 
+typedef enum Term {
+    TRANSIENT,
+    DIFFUSION
+} Term;
+
 API void print_matrix(double* matrix, int sizex, int sizey);
 
 API double* create_array(size_t size);
@@ -44,7 +49,7 @@ API double* transient_integrand(double x, double y);
 
 API double* transient_wrapper(double* element, int shape_num);
 
-API double* matrix_factory(Region region, int* term_list, int dof);
+API double* matrix_factory(Region region, Term term, int dof);
 
 API void test_function(double* points, int* face_map, size_t face_map_size, size_t points_size);
 

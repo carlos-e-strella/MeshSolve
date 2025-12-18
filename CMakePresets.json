@@ -22,7 +22,8 @@
             "inherits": "default",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Debug",
-                "COMPILE_TO_DLL": "OFF"
+                "COMPILE_TO_DLL": "OFF",
+                "CMAKE_FIND_DEBUG_MODE": "OFF"
             }
         }
     ],

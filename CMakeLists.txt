@@ -2,7 +2,10 @@ cmake_minimum_required(VERSION 4.0)
 
 project(MeshSolve C CXX Fortran)
 
-find_package(OpenBLAS REQUIRED)
+# list(PREPEND CMAKE_MODULE_PATH "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/share/clapack")
+
+find_package(OpenBLAS CONFIG REQUIRED)
+find_package(LAPACK REQUIRED)
 
 if(COMPILE_TO_DLL)
     add_library(meshsolve SHARED)
@@ -18,7 +21,12 @@ else()
     message(STATUS "Compiling code to executable.")
 endif()
 
+target_include_directories(meshsolve 
+    PRIVATE 
+        ${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
 target_link_libraries(meshsolve
-    PRIVATE OpenBLAS::OpenBLAS
+    PRIVATE OpenBLAS::OpenBLAS ${LAPACK_LIBRARIES} ${LAPACK_LINKER_FLAGS}
     )
     
