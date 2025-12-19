@@ -8,6 +8,8 @@
 #include <math.h>
 #include "meshsolve.h"
 
+typedef double (*Function2d)(double, double);
+
 typedef struct Region {
     double* element_map;
     int* face_map;
@@ -18,22 +20,100 @@ typedef struct Region {
 } Region;
 
 typedef enum Term {
+    SOURCE,
     TRANSIENT,
     DIFFUSION
 } Term;
+
+typedef struct Equation {
+    Region region;
+    Term* terms;
+    int term_num;
+    Function2d force_function;
+} Equation;
+
+// Bandwidth is required for lapack computations
+// Also just helpful in general
+typedef struct Matrix {
+    double* value;
+    double coefficient;
+    int upper_band;
+    int lower_band;
+    size_t sizex;
+    size_t sizey;
+} Matrix;
 
 // Reference for arrays that will be freed later
 double* array_reference[128];
 int array_index = 0;
 
 // Printing for matrices in column major order (what cblas uses)
-void print_matrix(double* matrix, int sizex, int sizey) {
+void print_matrix(Matrix matrix, char* name, int precision) {
+    (name) ? printf("%s:\n", name) : printf("M:\n");
+    size_t sizex = matrix.sizex; size_t sizey = matrix.sizey;
+
+    for (int i = 0; i < sizey; i++) {
+        printf(" | ");
+
+        for (int j = 0; j < sizex; j++) {
+            double number = matrix.value[i + j*sizey];
+
+            // Sometimes happens???
+            if (number == -0.0) { number = 0.0; }
+
+            int truncation = (int) number;
+            int digits = 0;
+            if (number >= 0.0) { printf(" "); }
+
+            if (truncation == 0) {
+                digits = 1;
+            }
+            else {
+                truncation = abs(truncation);
+                while (truncation != 0) {
+                    truncation /= 10;
+                    digits++;
+                }
+            }
+
+            // Max of 4 decimal places + 1 units place
+            digits = precision + 1 - digits;
+            if (digits < 0) { digits = 0; }
+            printf("%.*f", digits, number);
+            if (j < sizex - 1) { printf(" "); }
+        }
+
+        printf("  |\n");
+    }
+}
+
+Matrix band_store(Matrix matrix) {
+    size_t sizex = matrix.sizex; size_t sizey = matrix.sizey;
+    int KL = matrix.lower_band; int KU = matrix.upper_band;
+
+    int new_sizey = 2*KL + KU + 1;
+    double* band_matrix_value = array_constructor(sizex * new_sizey);
     for (int i = 0; i < sizey; i++) {
         for (int j = 0; j < sizex; j++) {
-            printf("%.4f ", matrix[i + j*sizey]);
+            int index = i + j*sizey;
+            double number = matrix.value[index];
+            int upper_index = j - i; int lower_index = i - j;
+            if (upper_index == 0 && lower_index == 0) {
+                band_matrix_value[KU + j*new_sizey + KL] = number;
+            }
+            else if (upper_index > 0 && KU >= upper_index) {
+                band_matrix_value[KU - upper_index + j*new_sizey + KL] = number;
+            }
+            else if (lower_index > 0 && KL >= lower_index) {
+                band_matrix_value[KU + lower_index + j*new_sizey + KL] = number;
+            }
         }
-        printf("\n");
     }
+    Matrix band_matrix;
+    band_matrix.value = band_matrix_value;
+    band_matrix.lower_band = KL; band_matrix.upper_band = KU;
+    band_matrix.sizex = sizex; band_matrix.sizey = new_sizey;
+    return band_matrix;
 }
 
 double* create_array(size_t size) {
@@ -188,14 +268,37 @@ double* dbl_integral_quad(double* (*integrand)(double, double), int shape_num) {
 // The actually useful part
 // TODO add triangular elements
 double quad_element_buffer[8];
+Function2d function_2d_buffer;
+
+// Integral for source term f on quadrilateral element
+// This integral returns a vector, and is not dependent on the unknown parameters u
+double* source_integrand(double x, double y) {
+    // Size four arrays
+    double* shape_funcs = shape_funcs_quad(x, y);
+    double* gradients = grad_shape_funcs_quad(x, y); 
+
+    // 2x2 matrix
+    double* jacobian = jacobian_quad(quad_element_buffer, gradients);
+    double determinant = determinant_2d(jacobian);
+
+    // Size 4 element vector
+    // Element VECTOR: Fi = Ni * f
+    double* integrand = create_array(4);
+    if (determinant) {
+        double f = function_2d_buffer(x, y) * determinant;
+        cblas_daxpy(4, f, shape_funcs, 1, integrand, 1);
+    }
+    else {
+        printf("WARN: Singular jacobian. Check your mesh geometry\n");
+    }
+    return integrand;
+}
 
 // Integral for transient term ∂T/∂t on a quadrilateral element
 double* transient_integrand(double x, double y) {
     // Size four arrays
     double* shape_funcs = shape_funcs_quad(x, y);
     double* gradients = grad_shape_funcs_quad(x, y); 
-
-    // 2x2 matrix
     double* jacobian = jacobian_quad(quad_element_buffer, gradients);
     double determinant = determinant_2d(jacobian);
 
@@ -217,7 +320,6 @@ double* diffusion_integrand(double x, double y) {
     double* shape_funcs = shape_funcs_quad(x, y);
     double* gradients = grad_shape_funcs_quad(x, y);
     double* jacobian = jacobian_quad(quad_element_buffer, gradients);
-    
     double determinant = determinant_2d(jacobian);
 
     // Element matrix: Kij ∇Ni · ∇Nj 
@@ -233,17 +335,17 @@ double* diffusion_integrand(double x, double y) {
         dgetri_(&size, jacobian, &size, ipiv, work, &work_size, &info);
         // jacobian pointer now holds the inverse jacobian
 
-        // Generate gradients in global coordinates for 4 shape functions
+        // Generate gradients in stiffness coordinates for 4 shape functions
         // Multiplies inverse transpose jacobian to each shape function gradient
-        double global_gradients[8];
+        double stiffness_gradients[8];
         for (int i = 0; i < 4; i++) {
             double* gradient = &(gradients[i*2]);
-            double* global_gradient = &(global_gradients[i*2]);
-            cblas_dgemv(CblasColMajor, CblasTrans, 2, 2, 1, jacobian, 2, gradient, 1, 0, global_gradient, 1);
+            double* stiffness_gradient = &(stiffness_gradients[i*2]);
+            cblas_dgemv(CblasColMajor, CblasTrans, 2, 2, 1, jacobian, 2, gradient, 1, 0, stiffness_gradient, 1);
         }
 
-        double* x = &(global_gradients[0]);
-        double* y = &(global_gradients[1]);
+        double* x = &(stiffness_gradients[0]);
+        double* y = &(stiffness_gradients[1]);
 
         cblas_dger(CblasColMajor, 4, 4, determinant, x, 2, x, 2, integrand, 4);
         cblas_dger(CblasColMajor, 4, 4, 1, y, 2, y, 2, integrand, 4);
@@ -254,21 +356,26 @@ double* diffusion_integrand(double x, double y) {
     return integrand;
 }
 
-// Global matrix creation
-// TODO support multiple dof and multiple terms
-double* matrix_factory(Region region, Term term, int dof) {
+// stiffness matrix creation
+// TODO support multiple dof 
+Matrix matrix_factory(Region region, Term term, int dof) {
     double* element_map = region.element_map;
     int* face_map = region.face_map;
-    int element_map_size = region.element_map_size;
+    int element_map_size = region.element_map_size; // Not used here
     int element_num = region.element_num;
     int shape_num = region.shape_num;
     int point_num = region.point_num;
 
     // Each point contributes with its own degrees of freedom
     int total_dof = point_num * dof;
-    double* global_matrix = array_constructor(total_dof * total_dof);
+    Matrix matrix;
+    double* stiffness_matrix = array_constructor(total_dof * total_dof);
+    int lower_band = 0; int upper_band = 0;
 
-    // Assembly into global matrix per element
+    int is_vector = 0; // Source integral returns a vector instead of a matrix
+                       // This would cause issues when assembeling without this flag
+
+    // Assembly into stiffness matrix per element
     // Currently only supports quad elements
     for (int i = 0; i < element_num; i++) {
         double* element = &(element_map[i*shape_num*2]);
@@ -276,38 +383,135 @@ double* matrix_factory(Region region, Term term, int dof) {
 
         int shape_array_num = shape_num * shape_num;
         double* element_matrix;
+
         switch (term) {
+            case SOURCE:
+                element_matrix = dbl_integral_quad(source_integrand, shape_num);
+                is_vector = 1;
+                break;
             case TRANSIENT: 
                 element_matrix = dbl_integral_quad(transient_integrand, shape_array_num);
                 break;
             case DIFFUSION:
                 element_matrix = dbl_integral_quad(diffusion_integrand, shape_array_num);
         }
-        element_matrix = transient_wrapper(element, shape_num);
 
         int* map = &(face_map[i*(shape_num+1)+1]);
 
-        for (int j = 0; j < shape_num; j++) {
-            for (int k = 0; k < shape_num; k++) {
-                int index = total_dof * map[j] + map[k];
-                global_matrix[index] += element_matrix[shape_num * j + k];
+        // Adds the value of the source integral to its corresponding point on the stiffness vector
+        if (is_vector) {
+            for (int j = 0; j < shape_num; j++) {
+                int index = map[j];
+                stiffness_matrix[index] += element_matrix[j];
+            }
+        }
+        // Adds the value of integrals to their corresponding point on the stiffness matrix
+        else {
+            for (int j = 0; j < shape_num; j++) {
+                for (int k = 0; k < shape_num; k++) {
+                    double element = element_matrix[shape_num * j + k];
+                    int index = total_dof * map[j] + map[k];
+                    stiffness_matrix[index] += element;
+
+                    if (element) {
+                        int new_upper = map[j] - map[k]; int new_lower = map[k] - map[j];
+                        upper_band = (new_upper > upper_band) ? new_upper : upper_band;
+                        lower_band = (new_lower > lower_band) ? new_lower : lower_band;
+                    }
+                }
             }
         }
         free(element_matrix); element_matrix = NULL;
     }
 
-    return global_matrix;
+    matrix.value = stiffness_matrix;
+    matrix.lower_band = lower_band;
+    matrix.upper_band = upper_band;
+    matrix.sizex = (is_vector) ? 1 : total_dof;
+    matrix.sizey = total_dof;
+    return matrix;
 }
 
-void test_function(double* points, int* face_map, size_t face_map_size, size_t points_size) {
-    Region region = get_region(points, face_map, face_map_size, points_size);
-    double* global_matrix = matrix_factory(region, TRANSIENT, 1);
-    print_matrix(global_matrix, region.point_num, region.point_num);
+// Assumes 1 dof per point
+Matrix evaluate(Equation equation) {
+    int term_num = equation.term_num;
+    Region region = equation.region;
+
+    // Currently only one force function can be specified
+    // Geniuenly, why would you have more?
+    function_2d_buffer = equation.force_function;
+    Matrix force_vector;
+    Matrix stiffness_matrix; 
+
+    for (int i = 0; i < term_num; i++) {
+        Term term = equation.terms[i];
+        Matrix matrix = matrix_factory(region, term, 1);
+        if (term == SOURCE) {
+            // Given that matrix factory returned a vector sizex would be 1
+            force_vector = matrix;
+        }
+        // TODO add more terms
+        else {
+            stiffness_matrix = matrix;
+        }
+    }
+
+    if (!stiffness_matrix.value) {
+        printf("FATAL ERROR: No stiffness matrix definition.");
+    }
+    if (!force_vector.value) {
+        force_vector.value = create_array(stiffness_matrix.sizey);
+        force_vector.sizex = 1;
+        force_vector.sizey = stiffness_matrix.sizey;
+    }
+
+    // Actually solving the linear system
+    Matrix band_matrix = band_store(stiffness_matrix);
+    
+    integer size = stiffness_matrix.sizex;
+    integer ldab = band_matrix.sizey;
+    integer lower_band = stiffness_matrix.lower_band;
+    integer upper_band = stiffness_matrix.upper_band;
+    integer* ipiv = (integer *) malloc(size * sizeof(integer)); 
+    integer info;
+    char no_transpose = 'N';
+    integer nrhs = 1;
+
+    dgbtrf_(&size, &size, &lower_band, &upper_band, band_matrix.value, &ldab, ipiv, &info);
+    if (info > 0) {
+        printf("FATAL ERROR: Stiffness matrix is singular! Probably due to unconstrained equation.");
+        exit(1);
+    }
+    dgbtrs_(&no_transpose, &size, &lower_band, &upper_band, &nrhs, band_matrix.value, &ldab, ipiv, 
+            force_vector.value, &size, &info);
+    free(ipiv);
+    free(stiffness_matrix.value);
+
+    return force_vector;
+}
+
+double test_force(double x, double y) {
+    return x * y;
+}
+
+void test_function(Region region) {
+    Equation equation;
+    Term terms[2] = {SOURCE, DIFFUSION};
+
+    // Initializing the equation struct members
+    equation.region = region;
+    equation.force_function = test_force;
+    equation.terms = terms;
+    equation.term_num = 2;
+
+    Matrix solution = evaluate(equation);
+    print_matrix(solution, "Solution", 5);
+    free(solution.value);
     array_destructor;
 }
 
 // Test function with values collected from a pyvista mesh
-// The mesh is a square subdivided into 9 parts
+// The mesh is a square subdivided into 4 faces and 9 points
 
 int main() {
     int ispec = 1;
@@ -315,6 +519,7 @@ int main() {
     double points[18] = {-0.5, -0.5, 0.0, -0.5, 0.5, -0.5, -0.5, 0.0, 0.0, 
         0.0, 0.5, 0.0, -0.5, 0.5, 0.0, 0.5, 0.5, 0.5};
 
-    test_function(points, face_map, 20, 18);
+    Region region = get_region(points, face_map, 20, 18);
+    test_function(region);
     return 0;
 }

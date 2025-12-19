@@ -9,6 +9,8 @@
 
 #include <stdlib.h>
 
+typedef double (*Function2d)(double, double);
+
 typedef struct Region {
     double* element_map;
     int* face_map;
@@ -19,11 +21,30 @@ typedef struct Region {
 } Region;
 
 typedef enum Term {
+    SOURCE,
     TRANSIENT,
     DIFFUSION
 } Term;
 
-API void print_matrix(double* matrix, int sizex, int sizey);
+typedef struct Equation {
+    Region region;
+    Term* terms;
+    int term_num;
+    Function2d force_function;
+} Equation;
+
+typedef struct Matrix {
+    double* value;
+    double coefficient;
+    int upper_band;
+    int lower_band;
+    size_t sizex;
+    size_t sizey;
+} Matrix;
+
+API void print_matrix(Matrix matrix, char* name, int precision);
+
+API Matrix band_store(Matrix matrix);
 
 API double* create_array(size_t size);
 
@@ -49,8 +70,10 @@ API double* transient_integrand(double x, double y);
 
 API double* transient_wrapper(double* element, int shape_num);
 
-API double* matrix_factory(Region region, Term term, int dof);
+API Matrix matrix_factory(Region region, Term term, int dof);
 
-API void test_function(double* points, int* face_map, size_t face_map_size, size_t points_size);
+API Matrix evaluate(Equation equation);
+
+API void test_function(Region region);
 
 #endif
