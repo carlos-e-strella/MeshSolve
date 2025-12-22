@@ -13,7 +13,6 @@ if(COMPILE_TO_DLL)
 
     target_sources(meshsolve 
         PRIVATE ${SRC_DIR}/meshsolve.c
-        PUBLIC ${SRC_DIR}/meshsolve.h
     )
     message(STATUS "Compiling code to DLL library.")
 else()

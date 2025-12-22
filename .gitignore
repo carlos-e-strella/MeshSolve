@@ -3,5 +3,5 @@
 /build
 /.venv
 
-# Python code is not working right now
-*.py
+# Python code used for debugging
+debug.py

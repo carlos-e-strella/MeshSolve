@@ -4,35 +4,24 @@ I am not a mathematician nor an engineer, so this program is probably packed wit
 
 This project uses the lapack and openblas linear algebra libraries for c, as well as cmake and vcpkg for build and package management respectively.
 
+If you are running the python demo you will have to install pyvista and numpy in your environment.
+I believe ctypes comes with python though.
+
 ## How do I use this program?
-Solutions are computed through calls to the `evaluate` function. Each call requires an `Equation` struct to be provided, which has to include relevant information on the mesh and the equation terms.
-Currently there are only three terms that can be declared as type `Term` (with only two of them actually working):
+Solutions are computed through calls to the `equation_assembler` function. Each call requires an `Equation` struct to be provided, which has to include relevant information on the mesh, the equation terms and initial conditions if you are doing a time dependant equation.
+Currently there are only three terms that can be declared as type `Term`:
 - `SOURCE`
-- `TRANSIENT` (there is no time stepping yet so this one does not work)
+- `TRANSIENT` 
 - `DIFFUSION`
 
-I will add more info on these terms and the finite element method in general but for now I have provided `test_function` really just as a showcase of some *actual* solutions that can be computed by meshsolve.
-```c
-void test_function(Region region) {
-    Equation equation;
-    Term terms[2] = {SOURCE, DIFFUSION};
+You can build the meshsolve dll and use it in other c programs (I geniuenly have no idea how you would do that) *or* you can go through the python wrapper implementation in `demo.py`, although there will be some performance issues if you try it with bigger meshes (I'm working on that). Here is the example provided in the demo file, where MeshSolve is used to solve the heat equation:
 
-    // Initializing the equation struct members
-    equation.region = region;
-    equation.force_function = test_force;
-    equation.terms = terms;
-    equation.term_num = 2;
+![Heat equation demo gif](images/heat_demo.gif)
 
-    Matrix solution = evaluate(equation);
-    print_matrix(solution, "Solution", 5);
-    free(solution.value);
-    array_destructor;
-}
-```
-More details are in the code as comments.
+More information is (or will be added) to the code itself.
 
 ### Building
-The cmake files *should* include openblas and lapack if you have vcpkg installed and I also provided the clapack fortran to c interface because I refuse to build lapacke from source. If you want yo build this yourself you should be able to call cmake configure with the provided presets, debug for executable and default for dll.
+The cmake files *should* include openblas and lapack if you have vcpkg installed and I also provided the clapack fortran to c interface because I refuse to build lapacke from source. If you want to build this yourself you should be able to call cmake configure with the provided presets, debug for executable and default for dll.
 
 ## The Finite Element Method
 

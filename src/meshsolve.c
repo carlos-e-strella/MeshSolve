@@ -25,13 +25,6 @@ typedef enum Term {
     DIFFUSION
 } Term;
 
-typedef struct Equation {
-    Region region;
-    Term* terms;
-    int term_num;
-    Function2d force_function;
-} Equation;
-
 // Bandwidth is required for lapack computations
 // Also just helpful in general
 typedef struct Matrix {
@@ -43,9 +36,47 @@ typedef struct Matrix {
     size_t sizey;
 } Matrix;
 
-// Reference for arrays that will be freed later
+typedef struct Equation {
+    Region region;
+    Term* terms;
+    int term_num;
+    Function2d force_function;
+    Matrix f;
+    Matrix k;
+    Matrix m;
+    Matrix ic;
+} Equation;
+
 double* array_reference[128];
 int array_index = 0;
+
+double* create_array(size_t size) {
+    double* memory = (double*) malloc(size * sizeof(double));
+    if (!memory) {
+        printf("Error during memory allocation\n");
+        return NULL;
+    }
+    for (int i = 0; i < size; i++) {
+        memory[i] = 0;
+    }
+    return memory;
+}
+
+double* array_constructor(size_t size) {
+    double* new_array = create_array(size);
+    array_reference[0] = new_array;
+    array_index++;
+    return new_array;
+}
+
+void array_destructor() {
+    for (int i = 0; i < 128; i++) {
+        if (array_reference[i] != NULL) {
+            free(array_reference[i]);
+            array_reference[i] = NULL;
+        }
+    }
+}
 
 // Printing for matrices in column major order (what cblas uses)
 void print_matrix(Matrix matrix, char* name, int precision) {
@@ -92,7 +123,7 @@ Matrix band_store(Matrix matrix) {
     int KL = matrix.lower_band; int KU = matrix.upper_band;
 
     int new_sizey = 2*KL + KU + 1;
-    double* band_matrix_value = array_constructor(sizex * new_sizey);
+    double* band_matrix_value = array_constructor(sizex* new_sizey);
     for (int i = 0; i < sizey; i++) {
         for (int j = 0; j < sizex; j++) {
             int index = i + j*sizey;
@@ -114,32 +145,6 @@ Matrix band_store(Matrix matrix) {
     band_matrix.lower_band = KL; band_matrix.upper_band = KU;
     band_matrix.sizex = sizex; band_matrix.sizey = new_sizey;
     return band_matrix;
-}
-
-double* create_array(size_t size) {
-    double* memory = (double*) malloc(size * sizeof(double));
-    if (!memory) {
-        printf("Error during memory allocation\n");
-        return NULL;
-    }
-    for (int i = 0; i < size; i++) {
-        memory[i] = 0;
-    }
-    return memory;
-}
-
-double* array_constructor(size_t size) {
-    double* new_array = create_array(size);
-    array_reference[0] = new_array;
-    array_index++;
-    return new_array;
-}
-
-void array_destructor() {
-    for (int i = 0; i <= 128; i++) {
-        free(array_reference[i]);
-        array_reference[i] = NULL;
-    }
 }
 
 // Apparently openblas does not have this?
@@ -320,7 +325,8 @@ double* diffusion_integrand(double x, double y) {
     double* shape_funcs = shape_funcs_quad(x, y);
     double* gradients = grad_shape_funcs_quad(x, y);
     double* jacobian = jacobian_quad(quad_element_buffer, gradients);
-    double determinant = determinant_2d(jacobian);
+    // Integration by parts results in a negative value for this term
+    double determinant = -1.0 * determinant_2d(jacobian);
 
     // Element matrix: Kij ∇Ni · ∇Nj 
     double* integrand = create_array(16);
@@ -433,37 +439,9 @@ Matrix matrix_factory(Region region, Term term, int dof) {
 }
 
 // Assumes 1 dof per point
-Matrix evaluate(Equation equation) {
-    int term_num = equation.term_num;
-    Region region = equation.region;
-
-    // Currently only one force function can be specified
-    // Geniuenly, why would you have more?
-    function_2d_buffer = equation.force_function;
-    Matrix force_vector;
-    Matrix stiffness_matrix; 
-
-    for (int i = 0; i < term_num; i++) {
-        Term term = equation.terms[i];
-        Matrix matrix = matrix_factory(region, term, 1);
-        if (term == SOURCE) {
-            // Given that matrix factory returned a vector sizex would be 1
-            force_vector = matrix;
-        }
-        // TODO add more terms
-        else {
-            stiffness_matrix = matrix;
-        }
-    }
-
-    if (!stiffness_matrix.value) {
-        printf("FATAL ERROR: No stiffness matrix definition.");
-    }
-    if (!force_vector.value) {
-        force_vector.value = create_array(stiffness_matrix.sizey);
-        force_vector.sizex = 1;
-        force_vector.sizey = stiffness_matrix.sizey;
-    }
+void evaluate(Equation* equation) {    
+    Matrix force_vector = equation->f;
+    Matrix stiffness_matrix = equation->k;
 
     // Actually solving the linear system
     Matrix band_matrix = band_store(stiffness_matrix);
@@ -479,35 +457,221 @@ Matrix evaluate(Equation equation) {
 
     dgbtrf_(&size, &size, &lower_band, &upper_band, band_matrix.value, &ldab, ipiv, &info);
     if (info > 0) {
-        printf("FATAL ERROR: Stiffness matrix is singular! Probably due to unconstrained equation.");
-        exit(1);
+        printf("FATAL ERROR: Stiffness matrix is singular!\n");
+        exit(EXIT_FAILURE);
     }
     dgbtrs_(&no_transpose, &size, &lower_band, &upper_band, &nrhs, band_matrix.value, &ldab, ipiv, 
             force_vector.value, &size, &info);
-    free(ipiv);
-    free(stiffness_matrix.value);
+    free(ipiv); ipiv = NULL;
+}
 
-    return force_vector;
+void step_rtk(Equation* equation, double step_size) {
+    Matrix* mass = &(equation->m);
+    Matrix* stiffness = &(equation->k);
+    Matrix* force = &(equation->f);
+    Matrix* ic = &(equation->ic);
+
+    // Doing the 4 rtk steps
+    double* k1 = create_array(ic->sizey);
+    double* k2 = create_array(ic->sizey);
+    double* k3 = create_array(ic->sizey);
+    double* k4 = create_array(ic->sizey);
+    double* ic_buffer = create_array(ic->sizey);
+    double* k_buffer = create_array(ic->sizey);
+
+    // K1
+    memcpy(k_buffer, force->value, force->sizey * sizeof(double));
+    cblas_dgemv(CblasColMajor, CblasNoTrans, stiffness->sizey, stiffness->sizex, -1.0, stiffness->value, 
+                stiffness->sizey, ic->value, 1, 1, k_buffer, 1);
+    cblas_dgemv(CblasColMajor, CblasNoTrans, mass->sizey, mass->sizex, 1, mass->value, mass->sizey, k_buffer,
+                1, 0, k1, 1);
+
+                
+    memcpy(k_buffer, force->value, force->sizey * sizeof(double));
+    memcpy(ic_buffer, ic->value, ic->sizey * sizeof(double));
+    cblas_daxpy(ic->sizey, step_size / 2, k1, 1, ic_buffer, 1);
+    cblas_dgemv(CblasColMajor, CblasNoTrans, stiffness->sizey, stiffness->sizex, -1.0, stiffness->value, 
+                stiffness->sizey, ic_buffer, 1, 1, k_buffer, 1);
+    cblas_dgemv(CblasColMajor, CblasNoTrans, mass->sizey, mass->sizex, 1, mass->value, mass->sizey, k_buffer,
+                1, 0, k2, 1);
+
+    // K3
+    memcpy(k_buffer, force->value, force->sizey * sizeof(double));
+    memcpy(ic_buffer, ic->value, ic->sizey * sizeof(double));
+    cblas_daxpy(ic->sizey, step_size / 2, k2, 1, ic_buffer, 1);
+    cblas_dgemv(CblasColMajor, CblasNoTrans, stiffness->sizey, stiffness->sizex, -1.0, stiffness->value, 
+                stiffness->sizey, ic_buffer, 1, 1, k_buffer, 1);
+    cblas_dgemv(CblasColMajor, CblasNoTrans, mass->sizey, mass->sizex, 1, mass->value, mass->sizey, k_buffer,
+                1, 0, k3, 1);
+
+    // K4
+    memcpy(k_buffer, force->value, force->sizey * sizeof(double));
+    memcpy(ic_buffer, ic->value, ic->sizey * sizeof(double));
+    cblas_daxpy(ic->sizey, step_size, k3, 1, ic_buffer, 1);
+    cblas_dgemv(CblasColMajor, CblasNoTrans, stiffness->sizey, stiffness->sizex, -1.0, stiffness->value, 
+                stiffness->sizey, ic_buffer, 1, 1, k_buffer, 1);
+    cblas_dgemv(CblasColMajor, CblasNoTrans, mass->sizey, mass->sizex, 1, mass->value, mass->sizey, k_buffer,
+                1, 0, k4, 1);
+
+    // Weighing
+    cblas_daxpy(ic->sizey, step_size / 6, k1, 1, ic->value, 1);
+    cblas_daxpy(ic->sizey, step_size / 3, k2, 1, ic->value, 1);
+    cblas_daxpy(ic->sizey, step_size / 3, k3, 1, ic->value, 1);
+    cblas_daxpy(ic->sizey, step_size / 6, k4, 1, ic->value, 1);
+
+    free(k1); free(k2); free(k3); free(k4); free(ic_buffer); free(k_buffer);
+    k1 = NULL; k2 = NULL; k3 = NULL; k4 = NULL; ic_buffer = NULL; k_buffer = NULL;
+}
+
+void equation_assembler(Equation* equation) {
+    Term* terms = equation->terms;
+    int term_num = equation->term_num;
+    if (!term_num) {
+        printf("FATAL ERROR: Number of terms is 0!\n");
+        exit(EXIT_FAILURE);
+    }
+    Region region = equation->region;
+    Matrix* force = &(equation->f);
+    Matrix* stiffness = &(equation->k);
+    Matrix* mass = &(equation->m);
+    Matrix* ic = &(equation->ic);
+
+    // Currently only one force function can be specified
+    // Geniuenly, why would you have more?
+    function_2d_buffer = equation->force_function;
+
+    int is_time_dependant = 0;
+
+    for (int i = 0; i < term_num; i++) {
+        Term term = terms[i];
+        Matrix matrix = matrix_factory(region, term, 1);
+        switch (term) {
+            case SOURCE:
+                *force = matrix;
+                break;
+            case TRANSIENT:
+                *mass = matrix;
+                is_time_dependant = 1;
+                break;
+            default:
+                *stiffness = matrix;
+                break;
+        }
+    }
+    if (!force->value) {
+        //! WILL BREAK ONCE DOING MULTIPLE DOF
+        force->value = array_constructor(region.point_num);
+        force->sizex = 1;
+        force->sizey = region.point_num;
+    }
+    if (!mass->value) {
+        if (!stiffness->value) {
+            printf("FATAL ERROR: No differential term definition.\n");
+            exit(EXIT_FAILURE);
+        }
+        // Remember to free this one!
+        evaluate(equation);
+        printf("Found solution to equation!\n");
+        return;
+    }
+    if (!stiffness->value) {
+        //! WILL ALSO BREAK ONCE DOING MULTIPLE DOF
+        stiffness->value = array_constructor(region.point_num * region.point_num);
+        stiffness->sizex = region.point_num;
+        stiffness->sizey = region.point_num;
+        stiffness->upper_band = region.point_num - 1;
+        stiffness->lower_band = region.point_num - 1;
+    }
+    if (!ic->value) {
+        ic->value = array_constructor(region.point_num);
+        ic->sizex = 1;
+        ic->sizey = region.point_num;
+    }
+    printf("Assembled ODE, ready for time stepping...\n");
+
+    // Doing the inverse mass matrix here because im not repeating it for every rtk step
+    /*
+    This gives an actually INSANE speed up when doing an element with 400 points.
+    I hope I wont have to do inverses every step when doing time dependant source functions.
+    */
+    
+    integer size = (integer) mass->sizex;
+    integer* ipiv = (integer *) malloc(size * sizeof(integer));
+    integer info;
+    double init_work[1];
+    integer test_work = -1;
+    dgetrf_(&size, &size, mass->value, &size, ipiv, &info);
+    if (info > 0) {
+        printf("FATAL ERROR: Mass matrix in singular!\n");
+        exit(EXIT_FAILURE);
+    }
+    //! THIS WILL CAUSE ISSUES WHEN SCALING
+    dgetri_(&size, mass->value, &size, ipiv, init_work, &test_work, &info);
+    integer lwork = (integer) init_work[0];
+    double* work = (double *) malloc(lwork * sizeof(double));
+    dgetri_(&size, mass->value, &size, ipiv, work, &lwork, &info);
+
+    free(ipiv); ipiv = NULL;
+}
+
+void clear_equation(Equation* equation) {
 }
 
 double test_force(double x, double y) {
     return x * y;
 }
 
-void test_function(Region region) {
+Matrix matrix_init() {
+    Matrix matrix;
+    matrix.coefficient = 0;
+    matrix.lower_band = 0;
+    matrix.upper_band = 0;
+    matrix.sizex = 0;
+    matrix.sizey = 0;
+    matrix.value = NULL;
+    return matrix;
+}
+
+Equation equation_init() {
     Equation equation;
-    Term terms[2] = {SOURCE, DIFFUSION};
+    equation.f = matrix_init();
+    equation.k = matrix_init();
+    equation.m = matrix_init();
+    equation.ic = matrix_init();
+    equation.force_function = NULL;
+    equation.term_num = 0;
+    equation.terms = NULL;
+    return equation;
+}
+
+void test_function(Region region) {
+    Equation equation = equation_init();
+    Term terms[2] = {TRANSIENT, DIFFUSION};
+
+    double ic[9] = {2.06773424, 1.25170255, 0.43567094, 2.31603169, 1.5, 0.68396842,
+ 2.06773424, 1.25170255, 0.43567094};
+
+    Matrix ic_matrix;
+    ic_matrix.value = ic;
+    ic_matrix.sizex = 1;
+    ic_matrix.sizey = 9;
 
     // Initializing the equation struct members
     equation.region = region;
     equation.force_function = test_force;
+    equation.ic = ic_matrix;
     equation.terms = terms;
     equation.term_num = 2;
 
-    Matrix solution = evaluate(equation);
-    print_matrix(solution, "Solution", 5);
-    free(solution.value);
-    array_destructor;
+    equation_assembler(&equation);
+    print_matrix(equation.ic, "Step 1", 4);
+    step_rtk(&equation, 0.001);
+    print_matrix(equation.ic, "Step 2", 4);
+    step_rtk(&equation, 0.001);
+    print_matrix(equation.ic, "Step 3", 4);
+    step_rtk(&equation, 0.001);
+    print_matrix(equation.ic, "Step 4", 4);
+    array_destructor();
 }
 
 // Test function with values collected from a pyvista mesh

@@ -26,13 +26,6 @@ typedef enum Term {
     DIFFUSION
 } Term;
 
-typedef struct Equation {
-    Region region;
-    Term* terms;
-    int term_num;
-    Function2d force_function;
-} Equation;
-
 typedef struct Matrix {
     double* value;
     double coefficient;
@@ -42,38 +35,29 @@ typedef struct Matrix {
     size_t sizey;
 } Matrix;
 
+typedef struct Equation {
+    Region region;
+    Term* terms;
+    int term_num;
+    Function2d force_function;
+    Matrix f;
+    Matrix k;
+    Matrix m;
+    Matrix ic;
+} Equation;
+
 API void print_matrix(Matrix matrix, char* name, int precision);
-
-API Matrix band_store(Matrix matrix);
-
-API double* create_array(size_t size);
-
-API double* array_constructor(size_t size);
-
-API void array_destructor();
-
-API double determinant_2d(double* matrix);
 
 API Region get_region(double* points, int* face_map, size_t face_map_size, size_t points_size);
 
-API double* shape_funcs_quad(double xi, double eta);
+API void evaluate(Equation* equation);
 
-API double* grad_shape_funcs_quad(double xi, double eta);
+API void step_rtk(Equation* equation, double step_size);
 
-API double* jacobian_quad(double* element, double* gradient);
+API void equation_assembler(Equation* equation);
 
-API double* quad_integral(double* (*integrand)(double), int shape_num);
+API void clear_equation(Equation* equation);
 
-API double* dbl_quad_integral(double* (*integrand)(double, double), int shape_num);
-
-API double* transient_integrand(double x, double y);
-
-API double* transient_wrapper(double* element, int shape_num);
-
-API Matrix matrix_factory(Region region, Term term, int dof);
-
-API Matrix evaluate(Equation equation);
-
-API void test_function(Region region);
+API Equation equation_init();
 
 #endif
